@@ -1,9 +1,7 @@
-const AWS = require('aws-sdk');
 const axios = require('axios');
 const fs = require('fs');
 require('dotenv').config();
 const { performance } = require('perf_hooks');
-const { BCDataStream } = require('./BCDataStream'); // Import the BCDataStream class
 const DynamoDB = require('./dynamodb');
 const { BitcoinBlock } = require('bitcoin-block');
 const path = require('path');
@@ -52,7 +50,7 @@ class Indexer {
             limit(async () => {
                 const response = await axios.post(process.env.BITCOIND_ENDPOINT, {
                     method: 'getblock',
-                    params: [blkHash, false],
+                    params: [blkHash, 2],
                 });
                 return response.data.result;
             })
@@ -89,19 +87,16 @@ class Indexer {
                 break;
             }
             const blockData = await this.getBlockData(blockHashes);
-            console.log('Current Block started: ', this.blockcount);
-            for (let idx = 0; idx < blockData.length; idx++) {
-                let blockNumber = this.blockcount + idx;
-                const rawBuf = Buffer.from(blockData[idx], 'hex');
-                const block = BitcoinBlock.decode(rawBuf);
-                const blockJSON = block.toPorcelain();
-                let start2 = performance.now();
-                await dynamodb.storeTransactions(blockJSON);
-                putDataTimeDiff += performance.now() - start2;
 
-                console.log(`Processed block ${blockNumber} with ${blockJSON.tx.length} transactions`);
-                const timestamp = blockJSON.tx[0].time;
-                await dynamodb.updateBlockMetadata(blockNumber, timestamp);
+            for (let idx = 0; idx < blockData.length; idx++) {
+                const current_block = blockData[idx]
+                let blockNumber = this.blockcount + idx;
+                let start2 = performance.now();
+                const tx_time = parseInt(current_block.time, 10);
+                await dynamodb.storeTransactions(current_block, tx_time);
+                putDataTimeDiff += performance.now() - start2;
+                console.log(`Processed block ${blockNumber} with ${current_block.tx.length} transactions`);
+                await dynamodb.updateBlockMetadata(blockNumber, tx_time);
                 if (blockNumber % 1000 === 0 && blockNumber > 0) {
                     const totalElapsedTime = (performance.now() - start) / 1000; // total since start
                     await storeTimings(
@@ -125,8 +120,8 @@ class Indexer {
             this.avg = (totalTime + (this.avg * (this.itercount - blockData.length))) / this.itercount;
 
             let estimatedTimeRemaining = (this.totalcount - this.blockcount) * this.avg;
-            console.log(`Estimated time remaining: ${estimatedTimeRemaining/1000} s`);
-            console.log(`Total Time: ${totalTime/1000}s | Get Block: ${getBlockTime/1000}s | Put: ${putDataTimeDiff/1000}s`);
+            console.log(`Estimated time remaining: ${(estimatedTimeRemaining/1000).toFixed(3)} s`);
+            console.log(`Total Time: ${(totalTime/1000).toFixed(3)}s | Get Block: ${(getBlockTime/1000).toFixed(3)}s | Put: ${(putDataTimeDiff/1000).toFixed(3)}s`);
         }
     }
 }

@@ -1,9 +1,16 @@
-const AWS = require('aws-sdk');
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const Redis = require('ioredis');
+const { 
+    DynamoDBDocumentClient,
+    GetCommand,
+    BatchWriteCommand,
+    BatchGetCommand,
+    PutCommand
+ } = require("@aws-sdk/lib-dynamodb");
 const { promisify } = require('util');
 const dotenv = require('dotenv');
 const zlib = require('zlib');
-const { log } = require('console');
-
+dotenv.config();
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 const base64Encode = (buffer) => buffer.toString('base64');
@@ -11,29 +18,24 @@ const base64Decode = (data) => Buffer.from(data, 'base64');
 const MAX_BATCH_SIZE = 25;
 const MAX_CONCURRENT_REQUESTS = 10; // Control the number of parallel requests to avoid throttling
 const DYNAMODB_CHUNK_SIZE = 400000; // Example, adjust based on your needs
-dotenv.config(); // Load environment variables from .env file
+ // Load environment variables from .env file
 
-
-// DynamoDB Configuration
-AWS.config.update({
-    region: 'us-west-2', // Replace with your region
-    endpoint: process.env.DYNAMODB_ENDPOINT // Use environment variable for endpoint
-});
 
 class DynamoDB {
     constructor(endpoint = process.env.DYNAMODB_ENDPOINT) {
         this.endpoint = endpoint;
-        this.dynamodb = new AWS.DynamoDB();
-        this.docClient = new AWS.DynamoDB.DocumentClient({
-            maxRetries: 10,              // More retries for throttled writes
-            httpOptions: {
-              timeout: 5000,              // Shorter timeout for each request
-              connectTimeout: 5000,
-            }
-          });
+        this.docClient = new DynamoDBClient({
+            region: process.env.AWS_REGION,
+            endpoint: process.env.DYNAMODB_ENDPOINT,
+            credentials: {
+                accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+                secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+            },
+        });
+        this.dynamodb = DynamoDBDocumentClient.from(this.docClient);
+        this.redisClient = new Redis(process.env.REDIS_CONNECTION_STRING);
         this.transactions_table = "transactions";
         this.addrhistory_table = "addrhistory";
-        this.txouts_table = "txouts";
         this.block_table = "block_metadata";
     }
 
@@ -75,7 +77,7 @@ class DynamoDB {
     }
 
     async _backupTables(blockNumber) {
-        const tablesToBackup = [this.block_table, this.transactions_table, this.addrhistory_table, this.txouts_table];
+        const tablesToBackup = [this.block_table, this.transactions_table, this.addrhistory_table];
 
         for (const tableName of tablesToBackup) {
             const params = {
@@ -98,7 +100,7 @@ class DynamoDB {
     
     async _asyncBatchWrite(tableName, items) {
         const { default: pLimit } = await import('p-limit');
-
+    
         const chunks = this._chunked(items, MAX_BATCH_SIZE);
         const limiter = pLimit(MAX_CONCURRENT_REQUESTS);
     
@@ -114,13 +116,13 @@ class DynamoDB {
             };
     
             try {
-                await this.docClient.batchWrite(params).promise();
+                const command = new BatchWriteCommand(params);
+                await this.docClient.send(command);
             } catch (error) {
                 console.error(`Error writing to ${tableName}:`, error);
             }
         }));
     
-        // Wait for all limited batch writes to complete
         await Promise.all(batchPromises);
     }
     
@@ -131,48 +133,6 @@ class DynamoDB {
             result.push(items.slice(i, i + size));
         }
         return result;
-    }
-    
-
-    async _asyncBatchRead(tableName, keys) {
-        const batchSize = 100; // Adjusted for your needs (DynamoDB max limit is 100 items)
-        let results = [];
-
-        for (let i = 0; i < keys.length; i += batchSize) {
-            const batchKeys = keys.slice(i, i + batchSize);
-            const params = {
-                RequestItems: {
-                    [tableName]: {
-                        Keys: batchKeys,
-                        ConsistentRead: true
-                    }
-                }
-            };
-
-            let retries = 5;
-            let response;
-
-            for (let attempt = 0; attempt < retries; attempt++) {
-                try {
-                    response = await this.dynamodb.batchGetItem(params).promise();
-                    results = results.concat(response.Responses[tableName] || []);
-                    const unprocessedKeys = response.UnprocessedKeys[tableName]?.Keys || [];
-
-                    if (unprocessedKeys.length === 0) {
-                        break;
-                    }
-
-                    // Retry with unprocessed keys
-                    params.RequestItems[tableName].Keys = unprocessedKeys;
-                    await sleep(0.01 * Math.pow(2, attempt)); // Exponential backoff
-                } catch (error) {
-                    console.error(`Error in batch read: ${error}`);
-                    break;
-                }
-            }
-        }
-
-        return results;
     }
 
     async _compressData(data) {
@@ -259,22 +219,24 @@ class DynamoDB {
         const addrHistoryBatch = [];
         for (const item of [...vins, ...vouts]) {
             const addr = item.address;
-            let count = timeCounters[`${addr}-${txTime}`] || 0;
-            const adjustedTime = txTime + count;
-            timeCounters[`${addr}-${txTime}`] = count + 1;
+            if (addr !== "NaN") {
+                let count = timeCounters[`${addr}-${txTime}`] || 0;
+                const adjustedTime = txTime + count;
+                timeCounters[`${addr}-${txTime}`] = count + 1;
 
-            addrHistoryBatch.push({
-                addr,
-                time: adjustedTime,
-                txid
-            });
+                addrHistoryBatch.push({
+                    addr,
+                    time: adjustedTime,
+                    txid
+                });
+            }
         }
         return addrHistoryBatch;
     }
 
-    async storeTransactions(block_data) {
+    async storeTransactions(block_data, tx_time) {
         const txs = block_data.tx;
-        const txTime = parseInt(block_data.time, 10);
+
         const startTotal = Date.now();
     
         // Start timing for fetching outputs and inputs
@@ -295,8 +257,8 @@ class DynamoDB {
             const tx = txs[idx];
             const txid = tx.txid;
             const txSize = parseInt(tx.size, 10);
-            txDetailBatchPromises.push(this.writeTxDetail(txid, txSize, txTime, formattedVins[idx], formattedVouts[idx]));
-            addrHistoryBatchPromises.push(this.writeAddrHistory(txid, txTime, formattedVins[idx], formattedVouts[idx], timeCounters));
+            txDetailBatchPromises.push(this.writeTxDetail(txid, txSize, tx_time, formattedVins[idx], formattedVouts[idx]));
+            addrHistoryBatchPromises.push(this.writeAddrHistory(txid, tx_time, formattedVins[idx], formattedVouts[idx], timeCounters));
             deleteTasks.push(this.deletePrevVouts(formattedVins[idx]));
         }
         let endProcessing = performance.now();
@@ -331,183 +293,111 @@ class DynamoDB {
             return [];
         }
     
-        const formattedVouts = outputs
-            .filter(output => output.scriptPubKey)
-            .map(output => ({
+        const pipeline = this.redisClient.pipeline(); // Batch commands
+        const formattedVouts = [];
+    
+        for (const output of outputs) {
+            if (!output.scriptPubKey) continue;
+    
+            const address = (output.scriptPubKey.addresses && output.scriptPubKey.addresses.length > 0)
+                ? output.scriptPubKey.addresses[0]
+                : 'NaN';
+    
+            const item = {
+                address,
+                value: Math.floor(output.value * 1e8),
+            };
+    
+            const key = `${txid}:${output.n}`;
+            pipeline.set(key, JSON.stringify(item));
+    
+            formattedVouts.push({
                 txid: String(txid),
                 vout_index: output.n,
-                address: (output.scriptPubKey.addresses && output.scriptPubKey.addresses.length > 0)
-                    ? output.scriptPubKey.addresses[0]
-                    : 'NO_ADDRESS',
-                value: Math.floor(output.value * 1e8),
-            }));
+                address: address,
+                value: item.value,
+            });
+        }
     
-        // If there are any outputs to write, pass the formattedVouts to _asyncBatchWrite
         if (formattedVouts.length > 0) {
-            await this._asyncBatchWrite(this.txouts_table, formattedVouts);  // _asyncBatchWrite will wrap items in PutRequest
+            await pipeline.exec();
         }
     
         return formattedVouts;
     }
+    
 
     async deletePrevVouts(vins) {
-        const batchWriteParams = vins.map(vin => ({
-            DeleteRequest: {
-                Key: {
-                    txid: vin.txid,
-                    vout_index: vin.vout_index
-                }
-            }
-        }));
-
-        if (batchWriteParams.length > 0) {
-            const params = { RequestItems: { [this.txouts_table]: batchWriteParams } };
-            await this.dynamodb.batchWriteItem(params).promise();
-        }
+        if (!vins || vins.length === 0) return;
+    
+        const keys = vins.map(vin => `${vin.txid}:${vin.vout_index}`);
+    
+        const pipeline = this.redisClient.pipeline();
+        keys.forEach(key => pipeline.del(key));
+        await pipeline.exec();
     }
+    
 
     async readInputs(txid, inputs) {
-        // Ensure the keys are properly formatted for batchGet
         const keys = inputs.map(input => {
             if (input.txid && input.vout_index !== undefined && input.vout_index !== null) {
-                return {
-                    txid: String(input.txid),        // Partition key (must be string)
-                    vout_index: Number(input.vout_index)     // Sort key (must be number)
-                };
+                return `${input.txid}:${input.vout}`;
             }
-            return null; // Explicitly return null if invalid
-        }).filter(Boolean); // Filter out invalid keys
-
-        // If no keys are provided, return an empty array
+            return null;
+        }).filter(Boolean);
+    
         if (keys.length === 0) return [];
-        const params = {
-            RequestItems: {
-                [this.txouts_table]: {
-                    Keys: keys 
-                }
-            }
-        };
-
+    
         try {
-            // Perform the batch get request
-            const response = await this.docClient.batchGet(params).promise();
-            let results = response.Responses.txouts || [];
+            const results = await this.redisClient.mget(keys);
     
-            // Handle cases where not all results are returned
-            if (results.length !== keys.length) {
-                // Fallback to query if some results are missing
-                const txData = await this.docClient.query({
-                    TableName: "txouts",
-                    KeyConditionExpression: 'txid = :txid',
-                    ExpressionAttributeValues: { ':txid': txid }
-                }).promise();
-    
-                // Process missing inputs by decompressing data
-                const vinsChunks = txData.Items.filter(item => item.chunk_info.startsWith('vins_'))
-                    .sort((a, b) => parseInt(a.chunk_info.split('_')[1]) - parseInt(b.chunk_info.split('_')[1]))
-                    .map(item => item.vins)
-                    .join('');
-    
-                if (vinsChunks) {
-                    results = await this._decompressData(vinsChunks);
+            const parsedResults = results.map((result, idx) => {
+                if (result) {
+                    const item = JSON.parse(result);
+                    return {
+                        txid: inputs[idx].txid,
+                        vout_index: inputs[idx].vout,
+                        address: item.address,
+                        value: item.value,
+                    };
                 }
+                return null;
+            }).filter(Boolean);
+    
+            if (parsedResults.length !== keys.length) {
+                throw new Error(`Txin lookup failed: txid=${txid}, expected_keys=${keys.length}, got_results=${parsedResults.length}, inputs=${JSON.stringify(inputs)}`);
             }
     
-            // Convert values to proper types for consistency
-            results.forEach(item => {
-                item.vout_index = parseInt(item.vout_index, 10);
-                item.value = parseInt(item.value, 10);
-            });
-    
-            return results;
-    
+            return parsedResults;
         } catch (error) {
-            console.error("Error fetching inputs:", error);
-            return [];
+            console.error("Error fetching inputs from Redis:", error);
+            throw error;
         }
     }
     
-    async getBalance(addr) {
+        
+    async updateBlockMetadata(blockcount, timestamp) {
         const params = {
-          TableName: this.txoutsTable,
-          IndexName: "addr_index",
-          KeyConditionExpression: "address = :address",
-          ExpressionAttributeValues: {
-            ":address": addr,
-          },
+            TableName: "block_metadata",
+            Item: {
+                id: "global_state",
+                blockcount,
+                timestamp,
+            },
         };
     
-        const result = await dynamodb.query(params).promise();
-        return result.Items.reduce((balance, txout) => balance + txout.value, 0);
-      }
-    
-      async lookupTxDetail(txid) {
-        const params = {
-          TableName: this.transactionsTable,
-          KeyConditionExpression: "txid = :txid",
-          ExpressionAttributeValues: {
-            ":txid": txid,
-          },
-        };
-    
-        const result = await dynamodb.query(params).promise();
-        const items = result.Items || [];
-    
-        if (!items.length) return null;
-    
-        let baseTxItem = null;
-        let vinsChunks = [];
-        let voutsChunks = [];
-    
-        items.forEach((item) => {
-          const chunkInfo = item.chunk_info;
-          if (chunkInfo === "metadata_0") {
-            baseTxItem = item;
-          } else if (chunkInfo.startsWith("vins_")) {
-            vinsChunks.push({ index: parseInt(chunkInfo.split("_")[1]), vins: item.vins });
-          } else if (chunkInfo.startsWith("vouts_")) {
-            voutsChunks.push({ index: parseInt(chunkInfo.split("_")[1]), vouts: item.vouts });
-          }
-        });
-    
-        if (!baseTxItem) return null;
-    
-        vinsChunks.sort((a, b) => a.index - b.index);
-        voutsChunks.sort((a, b) => a.index - b.index);
-    
-        const vinsData = vinsChunks.map((chunk) => chunk.vins).join("");
-        const voutsData = voutsChunks.map((chunk) => chunk.vouts).join("");
-    
-        return {
-          txid: baseTxItem.txid,
-          time: baseTxItem.tx_time,
-          size: baseTxItem.tx_size,
-          vins: await this.decompressData(vinsData),
-          vouts: await this.decompressData(voutsData),
-        };
-      }
-    
-      async updateBlockMetadata(blockcount, timestamp) {
-        const params = {
-          TableName: "block_metadata",
-          Item: {
-            id: "global_state",
-            blockcount,
-            timestamp,
-          },
-        };
-    
-        await this.docClient.put(params).promise();
-      }
+        const command = new PutCommand(params);
+        await this.docClient.send(command);
+    }
     
     async getLatestBlockcount() {
         const params = {
-            TableName: "block_metadata", // Use this.block_table to reference the block table
+            TableName: "block_metadata",
             Key: { id: "global_state" },
         };
     
-        // Replace dynamodb with this.dynamodb
-        const result = await this.docClient.get(params).promise();
+        const command = new GetCommand(params);
+        const result = await this.docClient.send(command);
         return result.Item ? result.Item.blockcount : 0;
     }
     

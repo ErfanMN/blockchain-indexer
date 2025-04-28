@@ -1,26 +1,44 @@
-const AWS = require("aws-sdk");
+const { 
+    DynamoDBClient, 
+    CreateTableCommand, 
+    ListTablesCommand, 
+    DeleteTableCommand 
+} = require("@aws-sdk/client-dynamodb");
+const { DynamoDBDocumentClient } = require("@aws-sdk/lib-dynamodb");
 const dotenv = require("dotenv");
-const { promisify } = require("util");
-
 dotenv.config();
-
-// Configure AWS DynamoDB
-AWS.config.update({
-    region: "us-west-2", // Change to your AWS region
-    endpoint: process.env.DYNAMODB_ENDPOINT || "http://localhost:8000" // Default to local DynamoDB endpoint if not provided
+docClient = new DynamoDBClient({
+    region: process.env.AWS_REGION,
+    endpoint: process.env.DYNAMODB_ENDPOINT,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
 });
-
-const dynamoDB = new AWS.DynamoDB();
-const docClient = new AWS.DynamoDB.DocumentClient();
-
+dynamoDB = DynamoDBDocumentClient.from(docClient);
+const Redis = require('ioredis');
 // Wrapper for async DynamoDB operations
-const createTable = promisify(dynamoDB.createTable.bind(dynamoDB));
-const listTables = promisify(dynamoDB.listTables.bind(dynamoDB));
+
+async function createTable(params) {
+    const command = new CreateTableCommand(params);
+    return await docClient.send(command);
+}
+
+async function listTables() {
+    const command = new ListTablesCommand({});
+    return await docClient.send(command);
+}
+
+async function deleteTable(tableName) {
+    const command = new DeleteTableCommand({ TableName: tableName });
+    return await docClient.send(command);
+}
 
 // Define the classes and methods to handle DynamoDB tables
 class IndexingDb {
     constructor() {
         this.dynamoDB = dynamoDB;
+        this.redis = new Redis(process.env.REDIS_CONNECTION_STRING);
     }
 
     async createBlockMetadata() {
@@ -35,35 +53,6 @@ class IndexingDb {
             console.log("Table block_metadata created successfully", result);
         } catch (err) {
             console.error("Error creating table block_metadata:", err);
-        }
-    }
-
-    async createTxouts() {
-        const params = {
-            TableName: "txouts",
-            KeySchema: [
-                { AttributeName: "txid", KeyType: "HASH" },
-                { AttributeName: "vout_index", KeyType: "RANGE" }
-            ],
-            AttributeDefinitions: [
-                { AttributeName: "txid", AttributeType: "S" },
-                { AttributeName: "vout_index", AttributeType: "N" },
-                { AttributeName: "address", AttributeType: "S" }
-            ],
-            BillingMode: "PAY_PER_REQUEST",
-            GlobalSecondaryIndexes: [
-                {
-                    IndexName: "addr_index",
-                    KeySchema: [{ AttributeName: "address", KeyType: "HASH" }],
-                    Projection: { ProjectionType: "ALL" }
-                }
-            ]
-        };
-        try {
-            const result = await createTable(params);
-            console.log("Table txouts created successfully", result);
-        } catch (err) {
-            console.error("Error creating table txouts:", err);
         }
     }
 
@@ -118,7 +107,6 @@ class IndexingDb {
 
             if (!tables.includes("transactions")) await this.createTransactions();
             if (!tables.includes("addrhistory")) await this.createAddrhistory();
-            if (!tables.includes("txouts")) await this.createTxouts();
             if (!tables.includes("block_metadata")) await this.createBlockMetadata();
 
             // List the tables again to verify
@@ -128,12 +116,13 @@ class IndexingDb {
             console.error("Error during table creation:", err);
         }
     }
+
     async deleteTable(tableName) {
         const params = {
             TableName: tableName
         };
         try {
-            const result = await this.dynamoDB.deleteTable(params).promise();
+            const result = await deleteTable(params);
             console.log(`Table ${tableName} deleted successfully`, result);
         } catch (err) {
             console.error(`Error deleting table ${tableName}:`, err);
@@ -147,11 +136,11 @@ class IndexingDb {
 
             const tables = existingTables.TableNames;
 
-            if (tables.includes("transactions")) await this.deleteTable("transactions");
-            if (tables.includes("addrhistory")) await this.deleteTable("addrhistory");
-            if (tables.includes("txouts")) await this.deleteTable("txouts");
-            if (tables.includes("block_metadata")) await this.deleteTable("block_metadata");
-
+            if (tables.includes("transactions")) await deleteTable("transactions");
+            if (tables.includes("addrhistory")) await deleteTable("addrhistory");
+            if (tables.includes("block_metadata")) await deleteTable("block_metadata");
+            await this.redis.flushdb();
+            await this.redis.quit();
             // List the tables again to verify deletion
             const newTables = await listTables();
             console.log("Existing Tables After Deletion:", newTables.TableNames);
@@ -176,6 +165,7 @@ async function main() {
     } else {
         console.log("Usage: node utils.js create/delete/backup");
     }
+    process.exit(0);
 }
 
 main().catch(console.error);
