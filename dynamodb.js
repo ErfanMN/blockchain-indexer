@@ -369,28 +369,12 @@ class DynamoDB {
     
         
     async updateBlockMetadata(blockcount, timestamp) {
-        const params = {
-            TableName: "block_metadata",
-            Item: {
-                id: "global_state",
-                blockcount,
-                timestamp,
-            },
-        };
-    
-        const command = new PutCommand(params);
-        await this.docClient.send(command);
+        await this.redisClient.set("block_count", String(blockcount));
     }
     
     async getLatestBlockcount() {
-        const params = {
-            TableName: "block_metadata",
-            Key: { id: "global_state" },
-        };
-    
-        const command = new GetCommand(params);
-        const result = await this.docClient.send(command);
-        return result.Item ? result.Item.blockcount : 0;
+        const result = await this.redisClient.get("block_count");
+        return result ? parseInt(result, 10) : 0;
     }
     
 }
