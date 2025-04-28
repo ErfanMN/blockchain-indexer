@@ -298,10 +298,8 @@ class DynamoDB {
     
         for (const output of outputs) {
             if (!output.scriptPubKey) continue;
-    
-            const address = (output.scriptPubKey.addresses && output.scriptPubKey.addresses.length > 0)
-                ? output.scriptPubKey.addresses[0]
-                : 'NaN';
+            
+            const address = output.scriptPubKey.address || 'NaN';
     
             const item = {
                 address,
@@ -326,31 +324,25 @@ class DynamoDB {
         return formattedVouts;
     }
     
-
     async deletePrevVouts(vins) {
         if (!vins || vins.length === 0) return;
-    
         const keys = vins.map(vin => `${vin.txid}:${vin.vout_index}`);
-    
         const pipeline = this.redisClient.pipeline();
         keys.forEach(key => pipeline.del(key));
         await pipeline.exec();
     }
-    
 
     async readInputs(txid, inputs) {
         const keys = inputs.map(input => {
-            if (input.txid && input.vout_index !== undefined && input.vout_index !== null) {
+            if (input.txid && input.vout) {
                 return `${input.txid}:${input.vout}`;
             }
             return null;
         }).filter(Boolean);
-    
         if (keys.length === 0) return [];
     
         try {
             const results = await this.redisClient.mget(keys);
-    
             const parsedResults = results.map((result, idx) => {
                 if (result) {
                     const item = JSON.parse(result);
