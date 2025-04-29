@@ -1,13 +1,17 @@
-const { 
+import { 
     DynamoDBClient, 
     CreateTableCommand, 
     ListTablesCommand, 
     DeleteTableCommand 
-} = require("@aws-sdk/client-dynamodb");
-const { DynamoDBDocumentClient } = require("@aws-sdk/lib-dynamodb");
-const dotenv = require("dotenv");
+} from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import dotenv from 'dotenv';
+
+// Initialize environment variables
 dotenv.config();
-docClient = new DynamoDBClient({
+
+// Create DynamoDB client instance
+const docClient = new DynamoDBClient({
     region: process.env.AWS_REGION,
     endpoint: process.env.DYNAMODB_ENDPOINT,
     credentials: {
@@ -15,9 +19,10 @@ docClient = new DynamoDBClient({
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     },
 });
-dynamoDB = DynamoDBDocumentClient.from(docClient);
-const Redis = require('ioredis');
+import Redis from 'ioredis';
+
 // Wrapper for async DynamoDB operations
+const dynamoDB = DynamoDBDocumentClient.from(docClient);
 
 async function createTable(params) {
     const command = new CreateTableCommand(params);
@@ -39,21 +44,6 @@ class IndexingDb {
     constructor() {
         this.dynamoDB = dynamoDB;
         this.redis = new Redis(process.env.REDIS_CONNECTION_STRING);
-    }
-
-    async createBlockMetadata() {
-        const params = {
-            TableName: "block_metadata",
-            KeySchema: [{ AttributeName: "id", KeyType: "HASH" }],
-            AttributeDefinitions: [{ AttributeName: "id", AttributeType: "S" }],
-            BillingMode: "PAY_PER_REQUEST"
-        };
-        try {
-            const result = await createTable(params);
-            console.log("Table block_metadata created successfully", result);
-        } catch (err) {
-            console.error("Error creating table block_metadata:", err);
-        }
     }
 
     async createAddrhistory() {
@@ -107,7 +97,6 @@ class IndexingDb {
 
             if (!tables.includes("transactions")) await this.createTransactions();
             if (!tables.includes("addrhistory")) await this.createAddrhistory();
-            if (!tables.includes("block_metadata")) await this.createBlockMetadata();
 
             // List the tables again to verify
             const newTables = await listTables();
@@ -138,7 +127,6 @@ class IndexingDb {
 
             if (tables.includes("transactions")) await deleteTable("transactions");
             if (tables.includes("addrhistory")) await deleteTable("addrhistory");
-            if (tables.includes("block_metadata")) await deleteTable("block_metadata");
             await this.redis.flushdb();
             await this.redis.quit();
             // List the tables again to verify deletion

@@ -1,15 +1,16 @@
-const axios = require('axios');
-const fs = require('fs');
-require('dotenv').config();
-const { performance } = require('perf_hooks');
-const DynamoDB = require('./dynamodb');
-const { BitcoinBlock } = require('bitcoin-block');
-const path = require('path');
+import axios from 'axios';
+import fs from 'fs';
+import dotenv from 'dotenv';
+import { performance } from 'perf_hooks';
+import DynamoDB from './dynamodb.js';
+import path, { dirname } from 'path';
+import { fileURLToPath } from 'url';
+// Initialize environment variables
+dotenv.config();
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
+// Get the directory name equivalent to __dirname in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 async function storeTimings(blockNumber, totalTime, getBlockTime, parseDataTime, putDataTime) {
     const filePath = path.join(__dirname, 'indexing_timings.csv');

@@ -1,24 +1,47 @@
-const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const Redis = require('ioredis');
-const { 
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import Redis from 'ioredis';
+import { 
     DynamoDBDocumentClient,
-    GetCommand,
-    BatchWriteCommand,
-    BatchGetCommand,
-    PutCommand
- } = require("@aws-sdk/lib-dynamodb");
-const { promisify } = require('util');
-const dotenv = require('dotenv');
-const zlib = require('zlib');
+    BatchWriteCommand
+} from '@aws-sdk/lib-dynamodb';
+import { promisify } from 'util';
+import dotenv from 'dotenv';
+import zlib from 'zlib';
+import pLimit from 'p-limit';
+
+// Initialize environment variables
 dotenv.config();
+
+// Promisify zlib methods
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
+
+// Base64 encoding and decoding
 const base64Encode = (buffer) => buffer.toString('base64');
 const base64Decode = (data) => Buffer.from(data, 'base64');
+
+// Constants
 const MAX_BATCH_SIZE = 25;
-const MAX_CONCURRENT_REQUESTS = 10; // Control the number of parallel requests to avoid throttling
-const DYNAMODB_CHUNK_SIZE = 400000; // Example, adjust based on your needs
- // Load environment variables from .env file
+const MAX_CONCURRENT_REQUESTS = 10;
+const DYNAMODB_CHUNK_SIZE = 400000;
+
+// Set up concurrency limiter
+const limiter = pLimit(MAX_CONCURRENT_REQUESTS);
+
+export {
+  DynamoDBClient,
+  Redis,
+  DynamoDBDocumentClient,
+  BatchWriteCommand,
+  gzip,
+  gunzip,
+  base64Encode,
+  base64Decode,
+  MAX_BATCH_SIZE,
+  MAX_CONCURRENT_REQUESTS,
+  DYNAMODB_CHUNK_SIZE,
+  limiter
+};
 
 
 class DynamoDB {
@@ -99,31 +122,40 @@ class DynamoDB {
     }
     
     async _asyncBatchWrite(tableName, items) {
-        const { default: pLimit } = await import('p-limit');
+        if (!items || items.length === 0) return;
     
         const chunks = this._chunked(items, MAX_BATCH_SIZE);
-        const limiter = pLimit(MAX_CONCURRENT_REQUESTS);
     
-        const batchPromises = chunks.map(chunk => limiter(async () => {
-            const batchItems = chunk.map(item => ({
-                PutRequest: { Item: item }
-            }));
+        const batchPromises = chunks.map(chunk => limiter(() => this._writeBatchWithRetry(tableName, chunk)));
+        await Promise.all(batchPromises);
+    }
     
-            const params = {
-                RequestItems: {
-                    [tableName]: batchItems
-                }
-            };
+    // New helper function for retry logic
+    async _writeBatchWithRetry(tableName, chunk, attempt = 0) {
+        const MAX_RETRIES = 5;
     
-            try {
-                const command = new BatchWriteCommand(params);
-                await this.docClient.send(command);
-            } catch (error) {
-                console.error(`Error writing to ${tableName}:`, error);
-            }
+        const batchItems = chunk.map(item => ({
+            PutRequest: { Item: item }
         }));
     
-        await Promise.all(batchPromises);
+        const params = {
+            RequestItems: {
+                [tableName]: batchItems
+            }
+        };
+    
+        try {
+            const command = new BatchWriteCommand(params);
+            const response = await this.docClient.send(command);
+    
+            const unprocessed = response.UnprocessedItems?.[tableName] || [];
+            if (unprocessed.length > 0 && attempt < MAX_RETRIES) {
+                console.warn(`Retrying ${unprocessed.length} unprocessed items (attempt ${attempt + 1})`);
+                await this._writeBatchWithRetry(tableName, unprocessed.map(req => req.PutRequest.Item), attempt + 1);
+            }
+        } catch (err) {
+            console.error(`Batch write failed for table ${tableName} (attempt ${attempt + 1}):`, err);
+        }
     }
     
     // Chunking function to divide items into smaller batches
@@ -269,7 +301,7 @@ class DynamoDB {
         const [txDetailBatchArrays, addrHistoryBatchArrays] = await Promise.all([
             Promise.all(txDetailBatchPromises),
             Promise.all(addrHistoryBatchPromises),
-        ]);
+            ]);
     
         // Flatten the arrays
         const txDetailBatch = txDetailBatchArrays.flat();
@@ -280,7 +312,7 @@ class DynamoDB {
             this._asyncBatchWrite(this.transactions_table, txDetailBatch),
             this._asyncBatchWrite(this.addrhistory_table, addrHistoryBatch),
             ...deleteTasks
-        ]);
+            ]);
         let endBatchWrite = performance.now();
         let batchWriteTime = (endBatchWrite - startBatchWrite) / 1000; // in seconds
    
@@ -379,4 +411,4 @@ class DynamoDB {
     
 }
 
-module.exports = DynamoDB;
+export default DynamoDB;
