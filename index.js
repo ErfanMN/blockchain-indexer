@@ -12,13 +12,13 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-async function storeTimings(blockNumber, totalTime, getBlockTime, parseDataTime, putDataTime) {
+async function storeTimings(blockNumber, totalTime, getBlockTime, putDataTime) {
     const filePath = path.join(__dirname, 'indexing_timings.csv');
     const fileExists = fs.existsSync(filePath);
     const currentTime = new Date().toISOString().replace('T', ' ').replace('Z', '');
 
-    const headers = ["Date_Time", "Block Number", "Total Time", "Get Block Time", "Parse Time", "Put Data Time"];
-    const row = [currentTime, blockNumber, totalTime, getBlockTime, parseDataTime, putDataTime];
+    const headers = ["Date_Time", "Block Number", "Total Time", "Get Block Time", "Put Data Time"];
+    const row = [currentTime, blockNumber, totalTime, getBlockTime, putDataTime];
 
     const dataToWrite = (fileExists ? '' : `${headers.join(",")}\n`) + row.join(",") + "\n";
 
@@ -80,14 +80,15 @@ class Indexer {
             this.fetchBlkBatch = parseInt(process.env.FETCH_BLK_BATCH || "100");
             const endBlock = Math.min(this.blockcount + this.fetchBlkBatch, this.totalcount - 1);
             const blockHashes = await this.getBlockHashes(this.blockcount, endBlock);
-            getBlockTime += performance.now() - start1;
-            let putDataTimeDiff = 0, parseDataTimeDiff = 0;
-
             if (blockHashes.length === 0) {
                 console.log("Block data is empty!");
                 break;
             }
             const blockData = await this.getBlockData(blockHashes);
+            getBlockTime += performance.now() - start1;
+            let putDataTimeDiff = 0;
+
+
 
             for (let idx = 0; idx < blockData.length; idx++) {
                 const current_block = blockData[idx]
@@ -104,7 +105,6 @@ class Indexer {
                         blockNumber,
                         totalElapsedTime.toFixed(3),
                         (getBlockTime / 1000).toFixed(3),
-                        (parseDataTime / 1000).toFixed(3),
                         (putDataTime / 1000).toFixed(3)
                     );
                     console.log(`Saved timing info at block ${this.blockcount}`);
@@ -114,7 +114,6 @@ class Indexer {
             // Increment block count after processing all blocks in the batch
             this.blockcount += blockData.length;
             let totalTime = performance.now() - start1;
-            parseDataTime += parseDataTimeDiff;
             putDataTime += putDataTimeDiff;
             this.itercount += blockData.length;
 

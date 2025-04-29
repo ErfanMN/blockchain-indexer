@@ -268,57 +268,52 @@ class DynamoDB {
 
     async storeTransactions(block_data, tx_time) {
         const txs = block_data.tx;
-
         const startTotal = Date.now();
     
-        // Start timing for fetching outputs and inputs
+        // Step 1: Fetch outputs and inputs
         let startOutputsInputs = performance.now();
         const formattedVouts = await Promise.all(txs.map(tx => this.writeOutputs(tx.txid, tx.vout)));
         const formattedVins = await Promise.all(txs.map(tx => this.readInputs(tx.txid, tx.vin)));
         let endOutputsInputs = performance.now();
-        let outputsInputsTime = (endOutputsInputs - startOutputsInputs) / 1000; // in seconds
+        let outputsInputsTime = (endOutputsInputs - startOutputsInputs) / 1000;
     
-        const txDetailBatchPromises = [];
-        const addrHistoryBatchPromises = [];
-        const timeCounters = {};
-        const deleteTasks = [];
-    
-        // Start timing for processing each transaction
+        // Step 2: Format data into batches
         let startProcessing = performance.now();
+        const txDetailBatch = [];
+        const addrHistoryBatch = [];
+        const deleteTasks = [];
+        const timeCounters = {};
+    
         for (let idx = 0; idx < txs.length; idx++) {
             const tx = txs[idx];
             const txid = tx.txid;
             const txSize = parseInt(tx.size, 10);
-            txDetailBatchPromises.push(this.writeTxDetail(txid, txSize, tx_time, formattedVins[idx], formattedVouts[idx]));
-            addrHistoryBatchPromises.push(this.writeAddrHistory(txid, tx_time, formattedVins[idx], formattedVouts[idx], timeCounters));
-            deleteTasks.push(this.deletePrevVouts(formattedVins[idx]));
+    
+            const txDetailItems = await this.writeTxDetail(txid, txSize, tx_time, formattedVins[idx], formattedVouts[idx]);
+            const addrHistoryItems = await this.writeAddrHistory(txid, tx_time, formattedVins[idx], formattedVouts[idx], timeCounters);
+            const deleteTask = this.deletePrevVouts(formattedVins[idx]);
+    
+            txDetailBatch.push(...txDetailItems);
+            addrHistoryBatch.push(...addrHistoryItems);
+            deleteTasks.push(deleteTask);
         }
         let endProcessing = performance.now();
-        let processingTime = (endProcessing - startProcessing) / 1000; // in seconds
+        let processingTime = (endProcessing - startProcessing) / 1000;
     
-        // Start timing for batch write
+        // Step 3: Batch write all at once
         let startBatchWrite = performance.now();
-        const [txDetailBatchArrays, addrHistoryBatchArrays] = await Promise.all([
-            Promise.all(txDetailBatchPromises),
-            Promise.all(addrHistoryBatchPromises),
-            ]);
-    
-        // Flatten the arrays
-        const txDetailBatch = txDetailBatchArrays.flat();
-        const addrHistoryBatch = addrHistoryBatchArrays.flat();
-    
-        // Time the actual batch write
         await Promise.all([
             this._asyncBatchWrite(this.transactions_table, txDetailBatch),
             this._asyncBatchWrite(this.addrhistory_table, addrHistoryBatch),
-            ...deleteTasks
-            ]);
+            ...deleteTasks,
+        ]);
         let endBatchWrite = performance.now();
-        let batchWriteTime = (endBatchWrite - startBatchWrite) / 1000; // in seconds
-   
+        let batchWriteTime = (endBatchWrite - startBatchWrite) / 1000;
+    
         const totalTime = (Date.now() - startTotal) / 1000;
         console.log(`storeTransactions Timing: Total=${totalTime.toFixed(3)}s | Fetch Outputs/Inputs=${outputsInputsTime.toFixed(3)}s | Process Transactions=${processingTime.toFixed(3)}s | Batch Write=${batchWriteTime.toFixed(3)}s`);
     }
+    
     
     async writeOutputs(txid, outputs) {
         if (!outputs || outputs.length === 0) {
